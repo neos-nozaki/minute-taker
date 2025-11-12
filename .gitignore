@@ -1,0 +1,75 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Environment variables
+.env
+.env.local
+
+# Audio files (but keep test_audio as reference)
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.ogg
+*.webm
+!tests/test_audio/.gitkeep  # Allow placeholder file
+
+# Test outputs
+tests/output/
+*.json.test
+local_output.json
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# AWS Lambda
+*.zip
+.aws-sam/
+lambda-transcribe/package/
+lambda-intelligence/package/
+
+# Logs
+*.log
+logs/
+
+# Docker
+.dockerignore
+
+# Secrets and sensitive files
+*secret*
+*key*
+!requirements.txt
+*.pem
+config.json
+credentials.json
+.env*
+!.env.example

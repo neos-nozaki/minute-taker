@@ -19,7 +19,7 @@ find . -name "*.zip" -not -path "./.git/*"
 
 # 3. packageディレクトリの確認
 find . -type d -name "package" -not -path "./.git/*"
-# → lambda-transcribe/package と lambda-intelligence/package が表示される（これは正常）
+# → src/transcribe/package, src/intelligence/package, src/classifier/package が表示される（これは正常）
 
 # 4. 環境変数ファイルの確認
 find . -name ".env*" -not -name ".env.example" -not -path "./.git/*"
@@ -39,8 +39,9 @@ grep -r "AKIA" . --exclude-dir=.git --exclude-dir=package --exclude="*.md" 2>/de
 
 - [x] `*.wav`, `*.mp3`, `*.m4a`, `*.flac`, `*.ogg`, `*.webm`
 - [x] `*.zip`
-- [x] `lambda-transcribe/package/`
-- [x] `lambda-intelligence/package/`
+- [x] `src/transcribe/package/`
+- [x] `src/intelligence/package/`
+- [x] `src/classifier/package/`
 - [x] `*secret*`, `*key*`
 - [x] `.env*`
 - [x] `config.json`, `credentials.json`
@@ -60,10 +61,16 @@ grep -r "AKIA" . --exclude-dir=.git --exclude-dir=package --exclude="*.md" 2>/de
 # 必須ファイルがすべて存在することを確認
 ls -la README.md
 ls -la .gitignore
-ls -la lambda-transcribe/lambda_function.py
-ls -la lambda-transcribe/requirements.txt
-ls -la lambda-intelligence/lambda_function.py
-ls -la lambda-intelligence/requirements.txt
+ls -la src/preprocessor/lambda_function.py
+ls -la src/preprocessor/requirements.txt
+ls -la src/transcribe/lambda_function.py
+ls -la src/transcribe/requirements.txt
+ls -la src/merger/lambda_function.py
+ls -la src/merger/requirements.txt
+ls -la src/classifier/lambda_function.py
+ls -la src/classifier/requirements.txt
+ls -la src/intelligence/lambda_function.py
+ls -la src/intelligence/requirements.txt
 ```
 
 ## ✅ Git初期化手順

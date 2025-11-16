@@ -1,72 +1,275 @@
-# 議事録作成システム（Minute Taker）
+# 音声コンテンツ分析システム（Minute Taker）
 
-音声ファイルをS3にアップロードすると、自動で文字起こし・要約・TODO抽出を行うシンプルなサーバーレスシステム
+音声ファイルをS3にアップロードすると、自動で文字起こし・分析・構造化を行うサーバーレスシステム
 
 > **⚠️ セキュリティ注意**: このリポジトリにはOpenAI APIキーやAWS認証情報は含まれていません。デプロイ前に必ずAWS Secrets Managerでキーを設定してください。
 
 ## システム概要
 
-- **入力**: 会議録音の音声ファイル（.wav, .mp3等）
-- **出力**: 文字起こしJSON（話者識別付き）、要約、TODO/アクションアイテム
-- **処理方式**: S3トリガー → Lambda（文字起こし） → Lambda（要約生成）
-- **主要技術**: Python 3.10+, AWS Lambda, S3, Secrets Manager, OpenAI API
+- **入力**: 音声ファイル（会議、面接、講義、日常会話など）
+- **出力**: 文字起こしJSON（話者識別付き）、分析結果（JSON/Markdown形式）
+- **処理方式**: S3トリガー → 4つのLambda関数による段階的処理
+- **主要技術**: Python 3.10+, AWS Lambda, S3, Secrets Manager, OpenAI API, ffmpeg
 
 ## 主な特徴
 
 - ✅ **話者識別** - `gpt-4o-transcribe-diarize`で「誰が何を話したか」を自動識別
+- ✅ **大容量ファイル対応** - 25MB/20分超過時にffmpegで自動分割
+- ✅ **並列同時実行** - 分割された音声チャンクを複数Lambdaで同時文字起こし、処理時間を大幅短縮
+- ✅ **統一的なチャンク処理** - 非分割ファイルもチャンク数1として統一処理
+- ✅ **アカウント・日付別管理** - `{account_name}/YYYY-MM-DD/` 構造で複数ユーザー・日付管理
 - ✅ **完全サーバーレス** - Fargate/ECS不要、Lambda関数のみで完結
 - ✅ **シンプルなインフラ** - S3 + Lambda + Secrets Manager だけ
 - ✅ **低コスト** - Lambda無料枠で十分、OpenAI APIのみ課金
-- ✅ **Graviton2 (arm64)** - 約20%コスト削減、高性能
-- ✅ **柔軟な録音方法** - Teams/Zoom/スマホ等、任意の方法で録音可能
-- ✅ **ディレクトリ構造の保持** - `ユーザー名/日付/ファイル名`の階層が自動的に維持
-- ✅ **バージョニング対応** - S3バージョニングで上書き・削除からファイルを保護
-- ✅ **柔軟な入力形式** - JSON、テキスト、Markdownなど任意のテキスト形式に対応
-- ✅ **選べる出力形式** - JSON（デフォルト）、Markdown、または両方を選択可能
-- ✅ **プロンプトで出力形式を自由にカスタマイズ** - Lambda: Intelligenceのプロンプトを変更するだけで、要約/TODO/議事録など任意の形式に対応可能
+- ✅ **JSON形式出力** - 構造化されたデータで他システムとの連携が容易
+- ✅ **柔軟なプロンプト管理** - S3に配置したプロンプトテンプレートでカスタマイズ可能
+- ✅ **自動コンテンツ分類** - GPT-4o-miniが文字起こしから最適なプロンプトを自動選択
+- ✅ **多様なコンテンツ対応** - 会議・面接・講義・日常会話など、用途別プロンプトを自動判定
+- ✅ **arm64最適化** - ClassifierとIntelligenceをarm64アーキテクチャで高速実行
+- ✅ **5段階パイプライン** - Preprocessor → Transcribe → Merger → Classifier → Intelligence
 
 ## アーキテクチャ
 
 ```
-[音声ファイル] 
-    ↓ (AWS CLI or 手動アップロード)
-[S3: raw-audio/ユーザー名/日付/]
-    ↓ (S3 Event Trigger)
-[Lambda: Transcribe (arm64)] 
-    ↓ (OpenAI gpt-4o-transcribe-diarize API)
-    ↓ 話者識別 + タイムスタンプ
-[S3: transcripts/ユーザー名/日付/]
-    ↓ (S3 Event Trigger)
-[Lambda: Intelligence (arm64)]
-    ↓ (OpenAI GPT-4o)
-    ↓ 要約 + TODO抽出
-[S3: summaries/ユーザー名/日付/] + [通知（オプション）]
+[ユーザー]
+    ↓ アップロード
+raw-audio/{account_name}/YYYY-MM-DD/{filename}.wav
+    ↓ S3 Event Trigger
+[Lambda: Preprocessor]
+    - ファイルサイズ・長さチェック
+    - 25MB/20分超過時に分割
+    - file_id 生成（= ファイル名から拡張子を除いたもの）
+    - _metadata.json 作成
+    ↓
+raw-audio-ready/{account_name}/YYYY-MM-DD/{file_id}/
+    ├── _metadata.json  (total_chunks: 1 or N)
+    ├── chunk-000.wav   (非分割でも chunk-000)
+    ├── chunk-001.wav   (分割時のみ)
+    └── chunk-002.wav
+    ↓ S3 Event Trigger (各チャンク)
+[Lambda: Transcribe] (並列実行、arm64)
+    - OpenAI gpt-4o-transcribe-diarize
+    - 各チャンク個別に文字起こし
+    ↓
+transcripts-chunks/{account_name}/YYYY-MM-DD/{file_id}/
+    ├── chunk-000.json
+    ├── chunk-001.json
+    └── chunk-002.json
+    ↓ S3 Event Trigger (各チャンク完了時)
+[Lambda: Merger] (Python 3.12)
+    - 全チャンク完了を待機（冪等）
+    - タイムスタンプ調整して統合
+    ↓
+transcripts/{account_name}/YYYY-MM-DD/{file_id}.json
+    ↓ S3 Event Trigger
+[Lambda: Classifier] (arm64、GPT-4o-mini)
+    - 文字起こし内容を分析
+    - 最適なプロンプトテンプレートを自動選択
+    - 判断理由と信頼度を記録
+    ↓
+classifications/{account_name}/YYYY-MM-DD/{file_id}.json
+    ↓ S3 Event Trigger
+[Lambda: Intelligence] (arm64、GPT-4o)
+    - Classifierが選択したプロンプトで分析実行
+    - 構造化されたJSON形式で出力
+    ↓
+outputs/{account_name}/YYYY-MM-DD/{file_id}.json
 ```
 
-**ディレクトリ構造例:**
+## S3ディレクトリ構造
+
 ```
-minute-taker-dev-nozaki/
+minute-taker-bucket/
+├── prompts/                                 ← プロンプトテンプレート
+│   ├── classifier/
+│   │   └── judge.md                         ← 分類判断用プロンプト
+│   └── intelligence/
+│       ├── meeting.md                       ← 会議用
+│       ├── interview.md                     ← 面接用
+│       ├── lecture.md                       ← 講義用
+│       └── casual_conversation.md           ← 日常会話用
+│
 ├── raw-audio/
-│   └── nozaki/
-│       └── 2025-11-12/
-│           ├── meeting-0900.wav
-│           └── meeting-1400.mp3
+│   └── {account_name}/                      ← アカウント名ディレクトリ
+│       └── YYYY-MM-DD/                      ← 日付ディレクトリ
+│           ├── meeting-audio.wav            ← ユーザーがアップロード
+│           ├── interview-recording.wav
+│           └── lecture-session.mp3
+│
+├── raw-audio-ready/
+│   └── {account_name}/
+│       └── YYYY-MM-DD/
+│           ├── meeting-audio/
+│           │   ├── _metadata.json           ← 制御ファイル
+│           │   └── chunk-000.wav            ← 非分割時も chunk-000
+│           ├── interview-recording/
+│           │   ├── _metadata.json
+│           │   ├── chunk-000.wav            ← 分割時
+│           │   ├── chunk-001.wav
+│           │   └── chunk-002.wav
+│           └── lecture-session/
+│               ├── _metadata.json
+│               └── chunk-000.wav
+│
+├── transcripts-chunks/
+│   └── {account_name}/
+│       └── YYYY-MM-DD/
+│           ├── meeting-audio/
+│           │   └── chunk-000.json
+│           ├── interview-recording/
+│           │   ├── chunk-000.json
+│           │   ├── chunk-001.json
+│           │   └── chunk-002.json
+│           └── lecture-session/
+│               └── chunk-000.json
+│
 ├── transcripts/
-│   └── nozaki/
-│       └── 2025-11-12/
-│           ├── meeting-0900.json
-│           └── meeting-1400.json
-└── summaries/
-    └── nozaki/
-        └── 2025-11-12/
-            ├── meeting-0900.json  (または .md)
-            └── meeting-1400.json  (または .md)
+│   └── {account_name}/
+│       └── YYYY-MM-DD/
+│           ├── meeting-audio.json           ← 最終的な文字起こし
+│           ├── interview-recording.json
+│           └── lecture-session.json
+│
+├── classifications/                         ← 分類結果
+│   └── {account_name}/
+│       └── YYYY-MM-DD/
+│           ├── meeting-audio.json
+│           ├── interview-recording.json
+│           └── lecture-session.json
+│
+└── outputs/                                 ← 最終分析結果（JSON形式）
+    └── {account_name}/
+        └── YYYY-MM-DD/
+            ├── meeting-audio.json
+            ├── interview-recording.json
+            └── lecture-session.json
 ```
 
 **重要なポイント:**
-- ディレクトリ構造（ユーザー名/日付）は自動的に保持される
-- ファイル名の重複を避けるため、時刻を含めることを推奨（例: `meeting-0900.wav`）
-- S3バージョニング有効で、上書きしても過去バージョンを保持
+- アカウント名/日付/ファイル名の階層構造で整理
+- すべてのファイルが`{account_name}/YYYY-MM-DD/{file_id}`で管理
+- 非分割ファイルも「チャンク数1」として統一処理
+- **Classifier層がGPT-4o-miniで自動的に最適なプロンプトを選択**
+- **分類結果は`classifications/`に永続化され、デバッグ・監査が可能**
+- **プロンプトテンプレートをS3で管理し、新しいテンプレート追加で自動認識**
+- **会議・面接・講義・日常会話など多様なコンテンツに自動対応**
+- **arm64アーキテクチャでClassifierとIntelligenceを高速実行**
+
+## プロジェクト構造
+
+```
+minute-taker/
+├── src/                      # Lambda関数ソース（Lambda非依存）
+│   ├── preprocessor/         # 1. 前処理・分割
+│   │   ├── lambda_function.py
+│   │   └── requirements.txt
+│   ├── transcribe/           # 2. 文字起こし
+│   │   ├── lambda_function.py
+│   │   └── requirements.txt
+│   ├── merger/               # 3. チャンク統合
+│   │   ├── lambda_function.py
+│   │   └── requirements.txt
+│   ├── classifier/           # 4. プロンプト自動選択（新規）
+│   │   ├── lambda_function.py
+│   │   └── requirements.txt
+│   └── intelligence/         # 5. 分析・構造化
+│       ├── lambda_function.py
+│       └── requirements.txt
+│
+├── prompts/                  # プロンプトテンプレート（S3にアップロード）
+│   ├── classifier/
+│   │   └── judge.md
+│   └── intelligence/
+│       ├── meeting.md
+│       ├── interview.md
+│       ├── lecture.md
+│       └── casual_conversation.md
+│
+├── tests/                    # テスト環境（S3構造を模倣）
+│   ├── raw-audio/
+│   ├── raw-audio-ready/
+│   ├── transcripts-chunks/
+│   ├── transcripts/
+│   ├── classifications/
+│   └── outputs/
+│
+├── tools/                    # ローカルテストスクリプト
+│   ├── test_preprocessor_local.py
+│   ├── test_transcribe_local.py
+│   ├── test_merger_local.py
+│   ├── test_intelligence_local.py
+│   └── upload_to_s3.py
+│
+├── docs/                     # ドキュメント
+│   ├── local_testing.md
+│   └── model_selection.md
+│
+└── rough_spec.md             # 要件仕様書
+```
+
+## metadata.jsonの例
+
+### 非分割時（チャンク数1）
+```json
+{
+  "file_id": "meeting-audio",
+  "account_name": "nozaki",
+  "date": "2025-11-17",
+  "original_file": "raw-audio/nozaki/2025-11-17/meeting-audio.wav",
+  "original_size_bytes": 20971520,
+  "original_duration_sec": 900,
+  "total_chunks": 1,
+  "split_required": false,
+  "created_at": "2025-11-17T09:00:00Z",
+  "chunks": [
+    {
+      "index": 0,
+      "file": "chunk-000.wav",
+      "start_time_sec": 0,
+      "end_time_sec": 900,
+      "size_bytes": 20971520
+    }
+  ]
+}
+```
+
+### 分割時（チャンク数3）
+```json
+{
+  "file_id": "interview-recording",
+  "account_name": "tanaka",
+  "date": "2025-11-18",
+  "original_file": "raw-audio/tanaka/2025-11-18/interview-recording.wav",
+  "original_size_bytes": 104857600,
+  "original_duration_sec": 3600,
+  "total_chunks": 3,
+  "split_required": true,
+  "created_at": "2025-11-18T14:00:00Z",
+  "chunks": [
+    {
+      "index": 0,
+      "file": "chunk-000.wav",
+      "start_time_sec": 0,
+      "end_time_sec": 1200,
+      "size_bytes": 34952533
+    },
+    {
+      "index": 1,
+      "file": "chunk-001.wav",
+      "start_time_sec": 1200,
+      "end_time_sec": 2400,
+      "size_bytes": 34952533
+    },
+    {
+      "index": 2,
+      "file": "chunk-002.wav",
+      "start_time_sec": 2400,
+      "end_time_sec": 3600,
+      "size_bytes": 34952534
+    }
+  ]
+}
+```
 
 ## 前提条件
 
@@ -75,234 +278,281 @@ minute-taker-dev-nozaki/
 - pip（Pythonパッケージマネージャー）
 - AWS CLI（設定済み）
 - OpenAI APIキー
+- **ffmpeg** （ローカルテスト用）
 
-### AWS事前準備（必須）
-
-以下のAWSリソースを事前に作成する必要があります：
+### AWS事前準備
 
 #### 1. S3バケット
 - **バケット名**: 任意（例: `minute-taker-yourname`）
 - **リージョン**: 任意（例: `ap-northeast-1`）
-- **バージョニング**: 有効化を推奨（ファイルの上書き・削除からの保護）
-  ```bash
-  aws s3api put-bucket-versioning \
-    --bucket your-bucket-name \
-    --versioning-configuration Status=Enabled
-  ```
-- **プレフィックス構造**:
-  - `raw-audio/ユーザー名/日付/` - 音声ファイルアップロード先
-  - `transcripts/ユーザー名/日付/` - 文字起こしJSON保存先
-  - `summaries/ユーザー名/日付/` - 要約JSON/Markdown保存先
+- **バージョニング**: 有効化を推奨
 
 #### 2. AWS Secrets Manager
 - **シークレット名**: 任意（例: `MinuteTaker/OpenAIKey`）
 - **シークレット値**: OpenAI APIキー
-- **形式オプション1（JSON）**:
-  ```json
-  {
-    "OPENAI_API_KEY": "sk-your-api-key-here"
-  }
-  ```
-- **形式オプション2（プレーンテキスト）**:
-  ```
-  sk-your-api-key-here
-  ```
+- **形式**: JSON `{"OPENAI_API_KEY": "sk-..."}` またはプレーンテキスト
 
-#### 3. IAMロール（Lambda用）× 2
+#### 3. IAMロール（Lambda用）× 4
+各Lambda関数用のロールを作成し、必要な権限を付与：
+- S3読み書き権限（各関数が必要とするプレフィックスのみ）
+- Secrets Manager読み取り権限
+- CloudWatch Logs書き込み権限
 
-**3-1. 文字起こしLambda用ロール**
-- ロール名: `MinuteTaker-TranscribeLambdaRole`
-- 必要なポリシー:
-  ```json
-  {
-    "Version": "2012-10-17",
-    "Statement": [
-      {
-        "Effect": "Allow",
-        "Action": [
-          "s3:GetObject",
-          "s3:PutObject"
-        ],
-        "Resource": [
-          "arn:aws:s3:::your-bucket-name/raw-audio/*",
-          "arn:aws:s3:::your-bucket-name/transcripts/*"
-        ]
-      },
-      {
-        "Effect": "Allow",
-        "Action": [
-          "secretsmanager:GetSecretValue"
-        ],
-        "Resource": "arn:aws:secretsmanager:region:account-id:secret:MinuteTaker/OpenAIKey-*"
-      },
-      {
-        "Effect": "Allow",
-        "Action": [
-          "logs:CreateLogGroup",
-          "logs:CreateLogStream",
-          "logs:PutLogEvents"
-        ],
-        "Resource": "arn:aws:logs:*:*:*"
-      }
-    ]
-  }
-  ```
+## ローカルテスト
 
-**3-2. 要約Lambda用ロール**
-- ロール名: `MinuteTaker-IntelligenceLambdaRole`
-- 必要なポリシー:
-  ```json
-  {
-    "Version": "2012-10-17",
-    "Statement": [
-      {
-        "Effect": "Allow",
-        "Action": [
-          "s3:GetObject",
-          "s3:PutObject"
-        ],
-        "Resource": [
-          "arn:aws:s3:::your-bucket-name/transcripts/*",
-          "arn:aws:s3:::your-bucket-name/summaries/*"
-        ]
-      },
-      {
-        "Effect": "Allow",
-        "Action": [
-          "secretsmanager:GetSecretValue"
-        ],
-        "Resource": "arn:aws:secretsmanager:region:account-id:secret:MinuteTaker/OpenAIKey-*"
-      },
-      {
-        "Effect": "Allow",
-        "Action": [
-          "logs:CreateLogGroup",
-          "logs:CreateLogStream",
-          "logs:PutLogEvents"
-        ],
-        "Resource": "arn:aws:logs:*:*:*"
-      },
-      {
-        "Effect": "Allow",
-        "Action": [
-          "sns:Publish"
-        ],
-        "Resource": "arn:aws:sns:region:account-id:MinuteTaker-Notifications"
-      }
-    ]
-  }
-  ```
-  ※ SNS通知を使わない場合は最後のSNS権限は不要
-
-#### 4. SNSトピック（オプション）
-- **トピック名**: `MinuteTaker-Notifications`
-- **用途**: 処理完了時のメール通知
-- **サブスクリプション**: 通知先メールアドレスを登録
-
-### AWS事前準備チェックリスト
-
-デプロイ前に以下を確認してください：
-
-- [ ] S3バケット作成済み
-- [ ] Secrets ManagerにOpenAI APIキー登録済み
-- [ ] IAMロール（文字起こしLambda用）作成済み
-- [ ] IAMロール（要約Lambda用）作成済み
-- [ ] （オプション）SNSトピック作成済み
-- [ ] AWS CLIで対象AWSアカウントに接続できる
-
-### ローカル開発・テスト
-
-Lambda関数をローカルでテストできます：
+詳細は `docs/local_testing.md` を参照。
 
 ```bash
-cd lambda-transcribe
-pip install -r requirements.txt
+# 1. Preprocessorテスト（分割処理確認）
+python tools/test_preprocessor_local.py
 
-# 環境変数を設定
-export OPENAI_API_KEY=sk-your-api-key
+# 2. Transcribeテスト（OpenAI API呼び出し、料金発生）
+export OPENAI_API_KEY='your-api-key'
+python tools/test_transcribe_local.py
 
-# テスト実行（Pythonスクリプトとして）
-python -c "
-from lambda_function import transcribe_audio_from_s3, OpenAI
-import os
-# ローカルテストコード
-"
+# 3. Mergerテスト（チャンク統合）
+python tools/test_merger_local.py
+
+# 4. Intelligenceテスト（要約生成、OpenAI API呼び出し）
+python tools/test_intelligence_local.py
 ```
 
-## デプロイ手順（AWS Lambda）
+テスト結果は `tests/` ディレクトリに保存されます。
 
-### 1. 依存関係のインストール
+## デプロイ手順
 
-各Lambda関数のディレクトリで依存関係をインストールします：
+### 1. ffmpeg Lambda Layerの作成
+
+Preprocessor LambdaでffmpegとffprobeWを使用するため、Lambda Layerを作成します。
 
 ```bash
-cd lambda-transcribe
-pip install -r requirements.txt -t .
+# ffmpeg静的ビルドをダウンロード（Amazon Linux 2互換）
+mkdir -p lambda-layer-ffmpeg/bin
+cd lambda-layer-ffmpeg/bin
+wget https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz
+tar xf ffmpeg-release-amd64-static.tar.xz
+cp ffmpeg-*-amd64-static/ffmpeg .
+cp ffmpeg-*-amd64-static/ffprobe .
+cd ..
 
-cd ../lambda-intelligence
-pip install -r requirements.txt -t .
+# Layerパッケージ作成
+mkdir -p ffmpeg-layer/bin
+cp bin/ffmpeg bin/ffprobe ffmpeg-layer/bin/
+cd ffmpeg-layer
+zip -r ../ffmpeg-layer.zip .
+cd ..
+
+# Lambda Layerをデプロイ
+aws lambda publish-layer-version \
+  --layer-name ffmpeg \
+  --zip-file fileb://ffmpeg-layer.zip \
+  --compatible-runtimes python3.10 \
+  --compatible-architectures x86_64
 ```
 
-### 2. Lambda関数のデプロイ（文字起こし）
+### 2. Lambda関数のデプロイ
+
+#### 2-1. Preprocessor Lambda
 
 ```bash
-cd lambda-transcribe
+cd src/preprocessor
+pip install -r requirements.txt -t package/
+cd package
+zip -r ../function-preprocessor.zip .
+cd ..
+zip -g function-preprocessor.zip lambda_function.py
+cd ../..
+
+aws lambda create-function \
+  --function-name MinuteTaker-Preprocessor \
+  --runtime python3.10 \
+  --role arn:aws:iam::YOUR_ACCOUNT_ID:role/MinuteTaker-PreprocessorRole \
+  --handler lambda_function.lambda_handler \
+  --zip-file fileb://src/preprocessor/function-preprocessor.zip \
+  --timeout 900 \
+  --memory-size 1024 \
+  --layers arn:aws:lambda:REGION:ACCOUNT:layer:ffmpeg:VERSION
+```
+
+#### 2-2. Transcribe Lambda
+
+```bash
+cd src/transcribe
+pip install -r requirements.txt -t package/
+cd package
 zip -r ../function-transcribe.zip .
 cd ..
+zip -g function-transcribe.zip lambda_function.py
+cd ../..
 
 aws lambda create-function \
   --function-name MinuteTaker-Transcribe \
   --runtime python3.10 \
-  --role arn:aws:iam::YOUR_ACCOUNT_ID:role/MinuteTaker-TranscribeLambdaRole \
+  --role arn:aws:iam::YOUR_ACCOUNT_ID:role/MinuteTaker-TranscribeRole \
   --handler lambda_function.lambda_handler \
-  --zip-file fileb://function-transcribe.zip \
+  --zip-file fileb://src/transcribe/function-transcribe.zip \
   --timeout 900 \
   --memory-size 512 \
-  --environment Variables="{OPENAI_API_KEY_SECRET=MinuteTaker/OpenAIKey,BUCKET_NAME=your-bucket-name}"
+  --environment Variables="{OPENAI_API_KEY_SECRET_NAME=MinuteTaker/OpenAIKey}"
 ```
 
-### 3. Lambda関数のデプロイ（要約）
+#### 2-3. Merger Lambda
 
 ```bash
-cd lambda-intelligence
-zip -r ../function-intelligence.zip .
+cd src/merger
+pip install -r requirements.txt -t package/
+cd package
+zip -r ../function-merger.zip .
 cd ..
+zip -g function-merger.zip lambda_function.py
+cd ../..
+
+aws lambda create-function \
+  --function-name MinuteTaker-Merger \
+  --runtime python3.10 \
+  --role arn:aws:iam::YOUR_ACCOUNT_ID:role/MinuteTaker-MergerRole \
+  --handler lambda_function.lambda_handler \
+  --zip-file fileb://src/merger/function-merger.zip \
+  --timeout 300 \
+  --memory-size 512
+```
+
+#### 2-4. Classifier Lambda (arm64)
+
+```bash
+# Dockerを使用してarm64向けにビルド
+cd src/classifier
+
+# Dockerコンテナ内でビルド
+docker run --rm \
+  --platform linux/arm64 \
+  -v "$PWD":/var/task \
+  -v "$PWD/../../deploy":/output \
+  public.ecr.aws/lambda/python:3.10 \
+  bash -c "pip install -r requirements.txt -t /var/task/package && \
+           cd /var/task/package && \
+           zip -r /output/function-classifier-arm64.zip . && \
+           cd /var/task && \
+           zip -g /output/function-classifier-arm64.zip lambda_function.py"
+
+cd ../..
+
+aws lambda create-function \
+  --function-name MinuteTaker-Classifier \
+  --runtime python3.10 \
+  --architectures arm64 \
+  --role arn:aws:iam::YOUR_ACCOUNT_ID:role/MinuteTaker-ClassifierRole \
+  --handler lambda_function.lambda_handler \
+  --zip-file fileb://deploy/function-classifier-arm64.zip \
+  --timeout 300 \
+  --memory-size 512 \
+  --environment Variables="{OPENAI_API_KEY_SECRET_NAME=MinuteTaker/OpenAIKey,PROMPT_BUCKET=your-bucket-name}"
+```
+
+#### 2-5. Intelligence Lambda (arm64)
+
+```bash
+# Dockerを使用してarm64向けにビルド
+cd src/intelligence
+
+# Dockerコンテナ内でビルド
+docker run --rm \
+  --platform linux/arm64 \
+  -v "$PWD":/var/task \
+  -v "$PWD/../../deploy":/output \
+  public.ecr.aws/lambda/python:3.10 \
+  bash -c "pip install -r requirements.txt -t /var/task/package && \
+           cd /var/task/package && \
+           zip -r /output/function-intelligence-arm64.zip . && \
+           cd /var/task && \
+           zip -g /output/function-intelligence-arm64.zip lambda_function.py"
+
+cd ../..
 
 aws lambda create-function \
   --function-name MinuteTaker-Intelligence \
   --runtime python3.10 \
-  --role arn:aws:iam::YOUR_ACCOUNT_ID:role/MinuteTaker-IntelligenceLambdaRole \
+  --architectures arm64 \
+  --role arn:aws:iam::YOUR_ACCOUNT_ID:role/MinuteTaker-IntelligenceRole \
   --handler lambda_function.lambda_handler \
-  --zip-file fileb://function-intelligence.zip \
+  --zip-file fileb://deploy/function-intelligence-arm64.zip \
   --timeout 300 \
   --memory-size 512 \
-  --environment Variables="{OPENAI_API_KEY_SECRET=MinuteTaker/OpenAIKey,BUCKET_NAME=your-bucket-name}"
+  --environment Variables="{OPENAI_API_KEY_SECRET_NAME=MinuteTaker/OpenAIKey,PROMPT_BUCKET=your-bucket-name}"
+```
+
+### 3. プロンプトテンプレートのアップロード
+
+```bash
+# プロンプトテンプレートをS3にアップロード
+aws s3 sync prompts/ s3://your-bucket-name/prompts/ --exclude "*" --include "*.md"
 ```
 
 ### 4. S3イベント通知の設定
 
-**文字起こしLambda用（raw-audio/へのアップロードをトリガー）**
-
-```bash
-aws s3api put-bucket-notification-configuration \
-  --bucket your-bucket-name \
-  --notification-configuration file://s3-notification-transcribe.json
-```
-
-`s3-notification-transcribe.json`:
 ```json
 {
   "LambdaFunctionConfigurations": [
     {
-      "LambdaFunctionArn": "arn:aws:lambda:region:account-id:function:MinuteTaker-Transcribe",
+      "Id": "trigger-preprocessor",
+      "LambdaFunctionArn": "arn:aws:lambda:REGION:ACCOUNT:function:MinuteTaker-Preprocessor",
       "Events": ["s3:ObjectCreated:*"],
       "Filter": {
         "Key": {
           "FilterRules": [
-            {
-              "Name": "prefix",
-              "Value": "raw-audio/"
-            }
+            {"Name": "prefix", "Value": "raw-audio/"}
+          ]
+        }
+      }
+    },
+    {
+      "Id": "trigger-transcribe",
+      "LambdaFunctionArn": "arn:aws:lambda:REGION:ACCOUNT:function:MinuteTaker-Transcribe",
+      "Events": ["s3:ObjectCreated:*"],
+      "Filter": {
+        "Key": {
+          "FilterRules": [
+            {"Name": "prefix", "Value": "raw-audio-ready/"},
+            {"Name": "suffix", "Value": ".wav"}
+          ]
+        }
+      }
+    },
+    {
+      "Id": "trigger-merger",
+      "LambdaFunctionArn": "arn:aws:lambda:REGION:ACCOUNT:function:MinuteTaker-Merger",
+      "Events": ["s3:ObjectCreated:*"],
+      "Filter": {
+        "Key": {
+          "FilterRules": [
+            {"Name": "prefix", "Value": "transcripts-chunks/"},
+            {"Name": "suffix", "Value": ".json"}
+          ]
+        }
+      }
+    },
+    {
+      "Id": "trigger-classifier",
+      "LambdaFunctionArn": "arn:aws:lambda:REGION:ACCOUNT:function:MinuteTaker-Classifier",
+      "Events": ["s3:ObjectCreated:*"],
+      "Filter": {
+        "Key": {
+          "FilterRules": [
+            {"Name": "prefix", "Value": "transcripts/"},
+            {"Name": "suffix", "Value": ".json"}
+          ]
+        }
+      }
+    },
+    {
+      "Id": "trigger-intelligence",
+      "LambdaFunctionArn": "arn:aws:lambda:REGION:ACCOUNT:function:MinuteTaker-Intelligence",
+      "Events": ["s3:ObjectCreated:*"],
+      "Filter": {
+        "Key": {
+          "FilterRules": [
+            {"Name": "prefix", "Value": "classifications/"},
+            {"Name": "suffix", "Value": ".json"}
           ]
         }
       }
@@ -311,381 +561,168 @@ aws s3api put-bucket-notification-configuration \
 }
 ```
 
-**要約Lambda用（transcripts/へのアップロードをトリガー）**
-
-同様に `s3-notification-intelligence.json` を作成し、`LambdaFunctionArn` と `prefix` を調整して適用します。
-
 ### 5. Lambda実行権限の付与
-
-S3がLambdaを呼び出せるよう権限を追加：
 
 ```bash
 aws lambda add-permission \
-  --function-name MinuteTaker-Transcribe \
+  --function-name MinuteTaker-Preprocessor \
   --statement-id s3-trigger \
   --action lambda:InvokeFunction \
   --principal s3.amazonaws.com \
   --source-arn arn:aws:s3:::your-bucket-name
 
-aws lambda add-permission \
-  --function-name MinuteTaker-Intelligence \
-  --statement-id s3-trigger \
-  --action lambda:InvokeFunction \
-  --principal s3.amazonaws.com \
-  --source-arn arn:aws:s3:::your-bucket-name
-```
-
-### AWSへのデプロイ
-
-詳細は `docs/deployment.md` を参照してください（作成予定）。
-
-## ディレクトリ構造
-
-```
-minute-taker/
-├── lambda-transcribe/    # 文字起こしLambda関数
-│   ├── lambda_function.py
-│   └── requirements.txt
-├── lambda-intelligence/  # 要約・TODO抽出Lambda関数
-│   ├── lambda_function.py
-│   └── requirements.txt
-├── tools/                # アップロード補助ツール等
-├── tests/                # テストデータ
-├── docs/                 # ドキュメント
-├── rough_spec.md         # 要件仕様書
-└── TODO.md               # 実装計画
+# 他の4つのLambda関数にも同様に実行
+# MinuteTaker-Transcribe, MinuteTaker-Merger, MinuteTaker-Classifier, MinuteTaker-Intelligence
 ```
 
 ## 使い方
 
-### 1. 音声ファイルの準備
-
-任意の方法で会議を録音：
-- Teams/Zoom/Google Meetの標準録音機能
-- OBS Studio、Audacity等の録音ソフト
-- スマートフォンの録音アプリ
-- ICレコーダー等
-
-**サポートされている音声形式:** mp3, mp4, mpeg, mpga, m4a, wav, webm, flac, ogg, opus（最大25MB）  
-詳細は[OpenAI Audio API公式ドキュメント](https://platform.openai.com/docs/guides/speech-to-text)を参照
-
-### 2. S3へのアップロード
-
-**ディレクトリ構造:**
-- `ユーザー名/日付/ファイル名` の形式を推奨
-- 同じ日に複数の会議がある場合は、時刻を含めることを推奨（例: `meeting-0900.wav`）
+### 1. 音声ファイルのアップロード
 
 ```bash
-# AWS CLIでアップロード（ディレクトリ構造を指定）
-aws s3 cp meeting_recording.wav s3://your-bucket-name/raw-audio/nozaki/2025-11-12/meeting-0900.wav
+# AWS CLIでアップロード（アカウント名/日付/ファイル名 の構造）
+aws s3 cp standup.wav s3://your-bucket-name/raw-audio/nozaki/2025-11-17/meeting-audio.wav
 
-# 複数ファイルをまとめてアップロード
-aws s3 sync ./recordings/ s3://your-bucket-name/raw-audio/nozaki/2025-11-12/
+# 大容量ファイルも気にせずアップロード（自動分割される）
+aws s3 cp interview.wav s3://your-bucket-name/raw-audio/tanaka/2025-11-18/interview-recording.wav
 
-# または、S3コンソールから手動アップロード
-# raw-audio/ユーザー名/日付/ の下にファイルを配置
+# 講義録音など、会議以外にも対応
+aws s3 cp lecture.mp3 s3://your-bucket-name/raw-audio/yamada/2025-11-19/lecture-session.mp3
 ```
 
-### 3. 処理の自動実行
+### 2. 処理の自動実行
 
 アップロード後、自動的に以下が実行されます：
-1. 文字起こし（**gpt-4o-transcribe-diarize** API）- Lambda関数で実行
-   - 話者識別（SPEAKER_00, SPEAKER_01...）
-   - セグメント単位のタイムスタンプ
-2. 要約生成（GPT-4o）- Lambda関数で実行
-3. TODO/アクションアイテム抽出
-4. 通知（メール or Webhook）
 
-### 4. 結果の確認
+1. **Preprocessor**: ファイルサイズ・長さチェック → 必要なら分割
+2. **Transcribe**: 各チャンクを並列に文字起こし
+3. **Merger**: 全チャンク完了後、タイムスタンプ調整して統合
+4. **Intelligence**: S3からプロンプト取得 → GPT-4oで分析・構造化
 
-**自動生成されるファイル:**
-- ディレクトリ構造が保持されます
-- `raw-audio/ユーザー名/日付/file.wav` → `summaries/ユーザー名/日付/file.json`
+### 2. 結果の確認
 
 ```bash
-# 文字起こし結果（JSON形式、話者識別・タイムスタンプ付き）
-aws s3 cp s3://your-bucket-name/transcripts/nozaki/2025-11-12/meeting-0900.json .
+# 最終的な文字起こし
+aws s3 cp s3://your-bucket-name/transcripts/nozaki/2025-11-17/meeting-audio.json .
 
-# 要約・TODO（JSON形式 - デフォルト）
-aws s3 cp s3://your-bucket-name/summaries/nozaki/2025-11-12/meeting-0900.json .
+# 分類結果
+aws s3 cp s3://your-bucket-name/classifications/nozaki/2025-11-17/meeting-audio.json .
 
-# 要約・TODO（Markdown形式 - OUTPUT_FORMAT=markdown の場合）
-aws s3 cp s3://your-bucket-name/summaries/nozaki/2025-11-12/meeting-0900.md .
+# 最終分析結果
+aws s3 cp s3://your-bucket-name/outputs/nozaki/2025-11-17/meeting-audio.json .
 
-# ディレクトリ全体をダウンロード
-aws s3 sync s3://your-bucket-name/summaries/nozaki/2025-11-12/ ./summaries/
+# 面接の文字起こし
+aws s3 cp s3://your-bucket-name/transcripts/tanaka/2025-11-18/interview-recording.json .
 ```
-
-## コスト見積もり
-
-### OpenAI API
-- **gpt-4o-transcribe-diarize**: $6/1M audio tokens（10分の会議 ≈ $0.36）
-  - 話者識別・タイムスタンプ付き
-  - 高精度な文字起こしと話者分離
-- GPT-4o: 入力$2.50/1M tokens、出力$10/1M tokens（要約生成 ≈ $0.10-0.50）
-
-### AWS
-- S3: ほぼ無料（数GB以下）
-  - バージョニング有効時は過去バージョンも保存されるため容量増加に注意
-- Lambda: 無料枠内で十分（月100万リクエスト、40万GB秒）
-  - **Graviton2 (arm64) 採用**で約20%コスト削減
-  - 文字起こしLambda: ~1-5分/会議 × 512MB メモリ
-  - 要約Lambda: ~10-30秒/会議 × 512MB メモリ
-
-**1会議あたりの推定コスト**: $0.45-1.00（10-60分の会議）
-**Graviton2 (arm64) 採用でインフラコスト約20%削減！**
-**最新モデルで高精度な話者識別！**
-
-## ベストプラクティス
-
-### ファイル命名規則
-- **ディレクトリ構造**: `ユーザー名/日付/ファイル名`
-  - 例: `raw-audio/nozaki/2025-11-12/meeting-0900.wav`
-- **ファイル名**: 時刻を含めることを推奨
-  - 同じ日に複数の会議がある場合の重複を回避
-  - 例: `meeting-0900.wav`, `meeting-1400.wav`
-
-### バージョン管理
-- S3バージョニングを有効化済み
-- ファイルを上書きしても過去バージョンを保持
-- 誤削除からの復元が可能
-
-### セキュリティ
-- OpenAI APIキーはSecrets Managerで管理
-- IAMロールで最小権限の原則を適用
-- S3バケットはプライベート設定を推奨
 
 ## 出力形式のカスタマイズ
 
-### 出力フォーマットの選択
+### 出力フォーマット
 
-Lambda Intelligenceの環境変数 `OUTPUT_FORMAT` で出力形式を選択できます：
+Intelligence Lambdaは**JSON形式のみ**で構造化された分析結果を出力します。これにより他システムとの連携が容易になります。
 
-- **`json`** (デフォルト) - プログラム処理に適した構造化データ
-- **`markdown`** - 人間が読みやすいMarkdown形式
-- **`both`** - JSON とMarkdown の両方を生成
-
-```bash
-# JSON形式（デフォルト）
-aws lambda update-function-configuration \
-  --function-name MinuteTaker-Intelligence \
-  --environment Variables="{OPENAI_API_KEY_SECRET_NAME=MinuteTaker/OpenAIKey,BUCKET_NAME=your-bucket-name,OUTPUT_FORMAT=json}"
-
-# Markdown形式
-aws lambda update-function-configuration \
-  --function-name MinuteTaker-Intelligence \
-  --environment Variables="{OPENAI_API_KEY_SECRET_NAME=MinuteTaker/OpenAIKey,BUCKET_NAME=your-bucket-name,OUTPUT_FORMAT=markdown}"
-
-# 両方
-aws lambda update-function-configuration \
-  --function-name MinuteTaker-Intelligence \
-  --environment Variables="{OPENAI_API_KEY_SECRET_NAME=MinuteTaker/OpenAIKey,BUCKET_NAME=your-bucket-name,OUTPUT_FORMAT=both}"
-```
-
-### 入力ファイル形式
-
-`transcripts/` ディレクトリにアップロードするファイルは以下の形式に対応：
-
-- **JSON形式**: `{"text": "会議内容..."}`
-- **プレーンテキスト**: `.txt`, `.md` など（拡張子は問わない）
-- Lambda関数が自動的に形式を判別して処理
-
-### プロンプトのカスタマイズ
-
-`summaries/` に格納される内容は、`lambda-intelligence/lambda_function.py` の `create_summary_prompt()` 関数を編集するだけで自由に変更できます。
-
-### 現在の実装（デフォルト）
-
-**JSON形式 (`OUTPUT_FORMAT=json`):**
+**出力例**:
 ```json
 {
-  "summary": "会議の要約",
-  "key_points": ["ポイント1", "ポイント2"],
-  "decisions": ["決定事項1"],
-  "action_items": [{"task": "...", "assignee": "...", "deadline": "..."}],
-  "next_steps": ["次のステップ1"],
+  "summary": "会議の概要...",
+  "participants": ["Aさん", "Bさん"],
+  "topics_discussed": ["トピック1", "トピック2"],
+  "action_items": [{"task": "...", "assignee": "..."}],
   "metadata": {
-    "transcript_s3_key": "transcripts/nozaki/2025-11-12/meeting.txt",
-    "generated_at": "2025-11-12T04:36:39.453447",
-    "transcript_length": 474
+    "file_id": "meeting-audio",
+    "account_name": "nozaki",
+    "date": "2025-11-17",
+    "classification": "meeting",
+    "confidence": 0.95
   }
 }
 ```
 
-**Markdown形式 (`OUTPUT_FORMAT=markdown`):**
-```markdown
-# 議事録
+### プロンプトテンプレートの自動選択
 
-## メタデータ
-- **生成日時**: 2025-11-12T04:36:39.453447
-- **元ファイル**: `transcripts/nozaki/2025-11-12/meeting.txt`
+Classifier Lambda（**arm64アーキテクチャで高速実行**）が文字起こしの内容を分析し、最適なプロンプトを自動選択します：
 
-## 要約
-会議の要約内容...
+- **`prompts/intelligence/meeting.md`** (デフォルト) - 会議の議事録作成
+- **`prompts/intelligence/interview.md`** - 面接・インタビュー分析
+- **`prompts/intelligence/lecture.md`** - 講義・セミナー分析
+- **`prompts/intelligence/casual_conversation.md`** - 日常会話の記録
 
-## 重要なポイント
-- ポイント1
-- ポイント2
+分類結果は `classifications/{file_id}.json` に保存されます。
 
-## 決定事項
-- 決定事項1
+### プロンプトのカスタマイズ
 
-## アクションアイテム
-- [ ] **タスク1**
-  - 担当: 田中さん
-  - 期限: 来週金曜日
+`outputs/` に格納される内容は、S3の `prompts/intelligence/` ディレクトリに配置したMarkdownテンプレートで自由に変更できます。テンプレート内で `{transcript_text}` が文字起こしテキストに置換されます。
 
-## 次のステップ
-- 次のステップ1
-```
+**カスタマイズ例:**
 
-### カスタマイズ例
-
-**例1: シンプルな要約のみ**
 ```python
-prompt = f"以下の会議の文字起こしを200-300文字で要約してください。\n\n{text}"
-```
-→ 要約テキストのみが `summaries/` に保存されます
+# シンプルな要約のみ
+以下の音声コンテンツを200-300文字で要約してください。
 
-**例2: TODOリスト形式**
-```python
-prompt = f"""以下の会議の文字起こしから、アクションアイテムをTODOリスト形式で抽出してください。
+{transcript_text}
 
-{text}
+# TODOリスト形式
+以下の会議からアクションアイテムをJSON形式で抽出してください。
 
-フォーマット:
-- [ ] タスク1 (担当: XX, 期限: YYYY/MM/DD)
-- [ ] タスク2 (担当: YY, 期限: YYYY/MM/DD)
-"""
-```
-→ チェックボックス付きTODOリストが `summaries/` に保存されます
+{transcript_text}
 
-**例3: Markdown議事録**
-```python
-prompt = f"""以下の文字起こしからMarkdown形式の議事録を作成してください。
+出力形式:
+{
+  "action_items": [
+    {"task": "...", "assignee": "...", "deadline": "..."}
+  ]
+}
 
-{text}
+# カスタムMarkdown形式
+以下からMarkdown形式のレポートを作成してください:
 
-# 議事録
+{transcript_text}
+
+# レポート
 ## 概要
-## 主な議論
-## 決定事項
-## アクションアイテム
-"""
+## 主なポイント
+## 次のステップ
 ```
-→ Markdown形式の議事録が `summaries/` に保存されます
-
-### ポイント
-- **プロンプトを変えるだけ** - コードのロジック変更は不要
-- **GPT-4oの柔軟性** - 自然言語で指示すれば、ほぼ期待通りの形式で返してくれる
-- **S3パスは変更不要** - `summaries/` という名前でも、中身は何でもOK
-- **同じインフラで多目的に対応** - 用途に応じてプロンプトだけ編集
 
 ## トラブルシューティング
 
-### 音声ファイルがアップロードされても処理が始まらない
-- CloudWatch LogsでLambda（Transcribe）のログを確認
-- S3イベント通知が正しく設定されているか確認
+### Preprocessorでffmpegエラー
 
-### 文字起こしの品質が悪い
-- 音声ファイルの品質を確認（ノイズ、音量）
-- 対応フォーマット（.wav, .mp3推奨）を使用
+- Lambda Layerが正しくアタッチされているか確認
+- ffmpegのパスが正しいか確認（`/opt/bin/ffmpeg`）
 
-### Lambdaタイムアウトエラー
-- 長時間の会議（60分以上）の場合、Lambdaのタイムアウト設定を延長（最大15分）
-- メモリを増やすと処理速度が向上（推奨: 1024MB以上）
+### Mergerが実行されない
+
+- CloudWatch Logsで「Waiting for all chunks」メッセージを確認
+- すべてのチャンクのTranscribeが完了しているか確認
+
+### タイムスタンプがずれる
+
+- metadata.jsonの`start_time_sec`が正しいか確認
+- Mergerがタイムオフセットを正しく適用しているか確認
+
+## コスト見積もり
+
+### OpenAI API
+- **gpt-4o-transcribe-diarize**: $6/1M audio tokens
+  - 10分の音声 ≈ $0.36
+  - 60分の音声（6チャンク） ≈ $2.16
+- **GPT-4o**: 入力$2.50/1M tokens、出力$10/1M tokens
+  - 分析生成 ≈ $0.10-0.50
+
+### AWS
+- **S3**: ほぼ無料（数GB以下）
+- **Lambda**: 無料枠内で十分
+  - Preprocessor: 分割時のみ実行時間増
+  - Transcribe: チャンク数 × 実行時間
+  - Merger: 軽量（数秒）
+  - Intelligence: 軽量（数秒）
+
+**1ファイルあたりの推定コスト**: $0.50-2.50（10-60分の音声）
 
 ## ライセンス
 
 MIT License
-
-## セキュリティとプライバシー
-
-### ⚠️ 重要な注意事項
-
-このリポジトリには以下の機密情報は**含まれていません**：
-- OpenAI APIキー
-- AWS認証情報
-- Lambda関数のデプロイメントパッケージ（`package/`ディレクトリ）
-- 実際の音声ファイルや議事録データ
-
-### デプロイ前の確認事項
-
-1. **APIキーの管理**
-   - OpenAI APIキーは必ずAWS Secrets Managerに保存
-   - 環境変数やコードに直接記述しない
-   - `.env`ファイルは`.gitignore`に含まれている
-
-2. **AWS認証情報**
-   - AWS CLIの認証情報（`~/.aws/credentials`）をコミットしない
-   - IAMロールを使用してLambda関数に権限を付与
-
-3. **音声データの取り扱い**
-   - 音声ファイルは`.gitignore`で除外されている
-   - 実際のデータはS3にのみ保存し、リポジトリにコミットしない
-
-### .gitignoreの確認
-
-以下がGitリポジトリから除外されていることを確認してください：
-- `*.wav`, `*.mp3`（音声ファイル）
-- `*secret*`, `*key*`（機密情報）
-- `lambda-*/package/`（Pythonパッケージ）
-- `*.zip`（デプロイメントパッケージ）
-- `.env`, `config.json`（設定ファイル）
-
-## GitHubへの公開
-
-### 初回セットアップ
-
-```bash
-# Gitリポジトリの初期化
-cd /path/to/minute-taker
-git init
-
-# .gitignoreの確認（機密情報が除外されていることを確認）
-cat .gitignore
-
-# 全ファイルをステージング
-git add .
-
-# 初回コミット
-git commit -m "Initial commit: Minute Taker serverless system"
-
-# GitHubリポジトリの作成（GitHub CLIを使用する場合）
-gh repo create minute-taker --public --source=. --remote=origin
-
-# または、GitHubでリポジトリを作成してからリモートを追加
-git remote add origin https://github.com/yourusername/minute-taker.git
-
-# プッシュ
-git branch -M main
-git push -u origin main
-```
-
-### コミット前の確認事項
-
-以下が**含まれていない**ことを必ず確認：
-```bash
-# 機密情報の確認
-git status | grep -E "secret|key|\.env|config\.json"
-
-# パッケージディレクトリの確認
-git status | grep "package/"
-
-# 音声ファイルの確認
-git status | grep -E "\.wav|\.mp3"
-
-# zipファイルの確認
-git status | grep "\.zip"
-```
-
-もし上記のコマンドで何か出力された場合は、`.gitignore`を修正してから再度`git add .`を実行してください。
-
-## 開発者向け
-
-- 詳細な実装計画: `TODO.md`
-- 要件仕様: `rough_spec.md`
-- モデル選択ガイド: `docs/model_selection.md`
 
 ## 貢献
 
